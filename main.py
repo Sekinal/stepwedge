@@ -26,7 +26,7 @@ nominal_step_lengths_mm = np.array([29.9, 30.0, 30.0, 30.0, 30.1])
 depths_water_mm = np.array([0.0, 52.5, 104.9, 157.4, 209.8, 262.5])
 
 # Plotting output
-OUT_PNG = "stepwedge_results.png"
+OUT_PNG = "stepwedge_results_inverted.png"
 
 # ------------------------- model implementation (modified) -------------------
 
@@ -63,7 +63,7 @@ def _changepoints_7_segments(y_s, n_bkps=6):
         sorted_indices = np.argsort(dy[peaks])[-n_bkps:] # Get indices of n_bkps largest peaks
         cps = peaks[sorted_indices]
 
-        return sorted(list(set(cps))) # Ensure unique and sorted
+    return sorted(list(set(cps))) # Ensure unique and sorted
 
 def find_peaks_simple(data, min_dist):
     """
@@ -73,7 +73,7 @@ def find_peaks_simple(data, min_dist):
     peaks = []
     if len(data) == 0:
         return np.array(peaks, dtype=int), {}
-    
+
     # Very basic peak finding: local maxima above threshold
     threshold = np.mean(data) + 0.5 * np.std(data) # Simple heuristic
 
@@ -92,57 +92,52 @@ def find_peaks_simple(data, min_dist):
 
 def _enforce_pattern_levels(levels_raw, x_vals, y_vals):
     """
-    Adjusts raw plateau levels to match the expected step-wedge pattern:
-    - s1 (air) is non-decreasing relative to itself (always true).
-    - s2-s6 (steps) are non-decreasing (your data goes up for the first few).
-    - s7 (final baseline) is forced to be lower than s6 (the last step plateau),
-      simulating the final drop.
-    Does not modify s1; s2-s6 are monotonically increased if a dip exists; s7 is adjusted.
+    Adjusts raw plateau levels to match the expected INVERTED step-wedge pattern:
+    - s1 (air) is the highest level.
+    - s2-s6 (steps) are non-increasing (signal decreases with depth).
+    - s7 (final baseline) is forced to be higher than s6 (the last step plateau),
+      simulating the final rise.
     """
     s = np.array(levels_raw, float)
 
-    # Enforce s1 to s6 non-decreasing (as indicated by "our data is actually increasing")
-    # This means steps get progressively higher or stay the same
-    # The paper shows decreasing steps (signal = f(thickness)), so if your signal *increases*
-    # with density/depth, this will be correct. If increasing thickness leads to decreasing
-    # signal (more absorption), then this should be reversed (cumulative minimum).
-    s_steps_inc = s[1:6] # S2 to S6
-    s[1:6] = np.maximum.accumulate(s_steps_inc) # Force non-decreasing for plateaus 2-6
+    # INVERTED: Enforce s1 to s6 non-increasing (signal decreases with steps)
+    # Changed from np.maximum.accumulate to np.minimum.accumulate
+    s_steps_dec = s[1:6] # S2 to S6
+    s[1:6] = np.minimum.accumulate(s_steps_dec) # Force non-increasing for plateaus 2-6
 
-    # Enforce s7 level to be below s6, given the "falls and decreases to about 0.25" description
-    # of the final segment.
-    # Provide a reasonable bound to ensure it doesn't go too low or stick too high.
-    if s[6] >= s[5]: # If the last plateau is not clearly below the preceding one
-        # Try to pull s7 down based on the range of the main signal
+    # INVERTED: Enforce s7 level to be above s6 (final rise instead of drop)
+    if s[6] <= s[5]: # If the last plateau is not clearly above the preceding one
+        # Try to pull s7 up based on the range of the main signal
         min_overall_signal = np.amin(y_vals)
         max_overall_signal = np.amax(y_vals)
-        expected_low_level = min_overall_signal + 0.1 * (max_overall_signal - min_overall_signal)
-        
-        # Ensure s7 is below s6, but clamp it to avoid extreme values.
-        # It should also not go below the absolute minimum signal observed in the data.
-        s[6] = max(min_overall_signal, min(s[5] * 0.9, expected_low_level)) # Make it at least somewhat lower than s6 and above min observed
-        if s[6] > s_raw[6]: # If we had to pull it down, log it
-             logging.info(f"Adjusted S7 from {s_raw[6]:.2f} to {s[6]:.2f} to enforce final drop.")
+        expected_high_level = max_overall_signal - 0.1 * (max_overall_signal - min_overall_signal)
+
+        # Ensure s7 is above s6, but clamp it to avoid extreme values.
+        s[6] = min(max_overall_signal, max(s[5] * 1.1, expected_high_level))
+        logging.info(f"Adjusted S7 from {levels_raw[6]:.2f} to {s[6]:.2f} to enforce final rise.")
 
     logging.debug(f"Adjusted plateau levels: {s}")
     return s
 
 
-def _ramp_edges_from_cp(x, y_s, cp_idx, si, sj, search_halfwidth_idx=400):
+def _ramp_edges_from_cp(x, y_s, cp_idx, si, sj, search_halfwidth_idx=400, ramp_index=None):
     """
     Identifies the start (p_k) and end (p_{k+1}) of a ramp around a given changepoint index.
     It works by searching outwards from the changepoint, looking for where the
     signal deviates from the adjacent plateaus, or where the derivative is significant.
+
+    For the last ramp (ramp 5, s6->s7), we use more conservative estimation to preserve
+    the s6 plateau.
     """
     N = len(y_s)
     # Define a local search window around the changepoint
     i_start_window = max(0, cp_idx - search_halfwidth_idx)
     i_end_window = min(N - 1, cp_idx + search_halfwidth_idx)
-    
+
     # Slice the data for local analysis
     x_local = x[i_start_window : i_end_window + 1]
     y_local = y_s[i_start_window : i_end_window + 1]
-    
+
     if len(x_local) < 2: # Not enough data in window, fall back to cp itself
         return x[cp_idx], x[cp_idx]
 
@@ -160,6 +155,59 @@ def _ramp_edges_from_cp(x, y_s, cp_idx, si, sj, search_halfwidth_idx=400):
                           3 * mad if mad > 0 else 0.05 * np.std(dy_local))
     deriv_threshold = max(deriv_threshold, 1e-4) # Minimum threshold to avoid tiny values
 
+    # Special handling for the last ramp (ramp 5: s6->s7)
+    # This is the problematic ramp where s6 forms a V instead of a plateau
+    if ramp_index == 5:
+        # For this ramp, we want to be more conservative and ensure proper plateau detection
+        # Increase the threshold to avoid premature ramp detection
+        deriv_threshold *= 2.0
+
+        # Look for where the signal is truly stable at si (s6 level) before the ramp
+        # Find the longest stable region near si
+        stable_tolerance = 0.05 * np.abs(signal_diff) if signal_diff != 0 else 0.1 * np.std(y_local)
+        is_stable_at_si = np.abs(y_local - si) < stable_tolerance
+
+        # Find the last continuous stable region before the major transition
+        stable_regions = []
+        in_stable = False
+        start_stable = 0
+        for i in range(len(is_stable_at_si)):
+            if is_stable_at_si[i] and not in_stable:
+                start_stable = i
+                in_stable = True
+            elif not is_stable_at_si[i] and in_stable:
+                stable_regions.append((start_stable, i-1))
+                in_stable = False
+        if in_stable:
+            stable_regions.append((start_stable, len(is_stable_at_si)-1))
+
+        # Find the stable region closest to but before the changepoint
+        cp_local = cp_idx - i_start_window
+        valid_stable_regions = [(s, e) for s, e in stable_regions if e <= cp_local + 50]
+
+        if valid_stable_regions:
+            # Take the last (rightmost) stable region as the end of s6 plateau
+            last_stable_start, last_stable_end = valid_stable_regions[-1]
+            # The ramp should start after this stable region
+            i_ramp_start_local = last_stable_end
+
+            # For the ramp end, look for where signal reaches near sj (s7 level)
+            is_near_sj = np.abs(y_local - sj) < stable_tolerance
+            # Find first point after ramp start that's stable at sj
+            ramp_end_candidates = np.where(is_near_sj[i_ramp_start_local:])[0]
+            if len(ramp_end_candidates) > 0:
+                i_ramp_end_local = i_ramp_start_local + ramp_end_candidates[0]
+            else:
+                # Fallback: just add reasonable ramp width
+                i_ramp_end_local = min(len(x_local)-1, i_ramp_start_local + 200)
+
+            x_ramp_start = x_local[i_ramp_start_local]
+            x_ramp_end = x_local[i_ramp_end_local]
+
+            logging.info(f"Ramp 5 (s6->s7): Extended s6 plateau to x={x_ramp_start:.0f}")
+            return x_ramp_start, x_ramp_end
+
+    # Standard handling for other ramps
     # Identify points where the derivative indicates a significant slope
     if direction_sign != 0: # If there's an actual change in signal
         significant_slope_mask = (direction_sign * dy_local > deriv_threshold)
@@ -173,11 +221,11 @@ def _ramp_edges_from_cp(x, y_s, cp_idx, si, sj, search_halfwidth_idx=400):
         # These are the beginning and end of the detected ramp within the local window
         i_ramp_start_local = slope_indices_local[0]
         i_ramp_end_local = slope_indices_local[-1]
-        
+
         # Convert local indices back to global x-values
         x_ramp_start = x_local[i_ramp_start_local]
         x_ramp_end = x_local[i_ramp_end_local]
-        
+
         # Ensure start is before end
         if x_ramp_start > x_ramp_end:
             x_ramp_start, x_ramp_end = x_ramp_end, x_ramp_start
@@ -187,13 +235,13 @@ def _ramp_edges_from_cp(x, y_s, cp_idx, si, sj, search_halfwidth_idx=400):
         # Fallback if no clear slope is detected: use a transition point based on value
         # Find index closest to midpoint between si and sj within the window
         k_mid_local = np.argmin(np.abs(y_local - (si + sj) / 2.0))
-        
+
         # Estimate ramp "width" (e.g., 50 projections around the mid-point)
         ramp_half_width_proj = max(50, int(0.05 * len(x_local))) 
-        
+
         k_start_local = max(0, k_mid_local - ramp_half_width_proj)
         k_end_local = min(len(x_local) - 1, k_mid_local + ramp_half_width_proj)
-        
+
         return x_local[k_start_local], x_local[k_end_local]
 
 def piecewise_stepwedge(x, p, s):
@@ -281,7 +329,7 @@ def fit_stepwedge_time_profile(x, y):
     1. Smooths the signal.
     2. Identifies 6 changepoints (7 segments/plateaus).
     3. Calculates raw plateau levels from median values within segments.
-    4. Enforces the specific pattern (initial baseline, rising steps, final drop).
+    4. Enforces the INVERTED pattern (initial baseline high, falling steps, final rise).
     5. Determines ramp boundaries (p1-p12) by analyzing local derivatives
        around each changepoint.
     6. Constructs the final piecewise-linear model.
@@ -294,7 +342,7 @@ def fit_stepwedge_time_profile(x, y):
     # Find 6 changepoints that define the 7 segments (plateaus)
     # cps are 0-based indices in the original x/y arrays.
     cps = _changepoints_7_segments(y_s, n_bkps=6)
-    
+
     # Add start and end points to define segment ranges
     seg_edges_indices = [0] + cps + [N-1] # N-1 for last index, N for exclusive boundary
 
@@ -325,7 +373,7 @@ def fit_stepwedge_time_profile(x, y):
 
         s_raw.append(np.median(core_data) if len(core_data) > 0 else 0.0)
 
-    # Enforce the expected pattern of plateau levels based on physical understanding
+    # Enforce the expected INVERTED pattern of plateau levels
     s_final = _enforce_pattern_levels(s_raw, x, y)
     logging.info(f"Final determined plateau levels s1-s7: {np.array2string(s_final, precision=2)}")
 
@@ -336,14 +384,15 @@ def fit_stepwedge_time_profile(x, y):
         cp_idx = cps[k] # Index of the current changepoint
         si = s_final[k]   # Signal level of the plateau BEFORE this ramp
         sj = s_final[k+1] # Signal level of the plateau AFTER this ramp
-        
+
         # Call the helper to find the start and end of the ramp in x-coordinates
-        x_ramp_start, x_ramp_end = _ramp_edges_from_cp(x, y_s, cp_idx, si, sj)
+        # Pass ramp_index for special handling of the last ramp
+        x_ramp_start, x_ramp_end = _ramp_edges_from_cp(x, y_s, cp_idx, si, sj, ramp_index=k+1)
         ramp_bounds.append((x_ramp_start, x_ramp_end))
 
     # Assemble the final p1-p12 array from the detected ramp boundaries
     p_final = np.array([val for pair in ramp_bounds for val in pair], dtype=float)
-    
+
     # Ensure p-values are strictly increasing and within the x-data range
     xmin, xmax = x.min(), x.max()
     p_final = np.clip(p_final, xmin, xmax) # Keep within data bounds
@@ -361,7 +410,7 @@ def fit_stepwedge_time_profile(x, y):
     ss_res = np.sum((y - y_fit) ** 2)
     ss_tot = np.sum((y - np.mean(y)) ** 2) + 1e-12 # Add small epsilon to avoid division by zero
     r2 = 1.0 - ss_res / ss_tot
-    
+
     return p_final, s_final, y_fit, r2
 
 
@@ -432,7 +481,7 @@ def main():
     y = y_raw[order]
 
     # Perform the step-wedge profile fitting
-    logging.info("Starting step-wedge profile fitting...")
+    logging.info("Starting step-wedge profile fitting (INVERTED)...")
     p, s, y_fit, r2 = fit_stepwedge_time_profile(x, y)
     logging.info(f"Step-wedge profile fit completed. R^2 = {r2:.5f}")
 
@@ -446,7 +495,7 @@ def main():
         p[8] - p[7], # Ramp 4 (s4->s5), then plateau s5
         p[10] - p[9] # Ramp 5 (s5->s6), then plateau s6
     ])
-    
+
     # Convert projection differences to time, then to length in mm
     times_s = ramp_intervals_projections * time_per_projection_s
     measured_lengths_mm = times_s * couch_speed_mm_s
@@ -464,7 +513,7 @@ def main():
     # PDD Analysis: Use the first 6 plateau levels (s1 to s6) for PDD calculation.
     # Note: s1 corresponds to air (0mm depth), s2 to 52.5mm, etc.
     s_levels_for_pdd = np.array(s[:6], dtype=float) # Plateaus s1 through s6
-    
+
     # Fit an exponential curve to relate signal levels to depths
     pdd_fit_func, pdd_params, D20_over_D10 = fit_pdd(depths_water_mm, s_levels_for_pdd)
 
@@ -476,7 +525,7 @@ def main():
     # Generate points for plotting the continuous PDD curve
     depths_plot = np.linspace(0, max(depths_water_mm) * 1.1, 300) # Extend range slightly
     pdd_curve_normalized = (pdd_fit_func(depths_plot) / (norm_at_5cm_value + 1e-12)) * 100.0
-    
+
     logging.info(f"PDD D20/D10 ratio: {D20_over_D10:.3f}")
 
     # ----------------------------- plotting results ----------------------------------
@@ -487,7 +536,7 @@ def main():
     # Plot A: Time-profile of single CT channel with fitted model
     axA.plot(x, y, color="tab:blue", lw=1.0, label="Measured Signal")
     axA.plot(x, y_fit, color="tab:red", lw=2.5, label="Fitted Model") # Changed color for better contrast
-    axA.set_title("A) Time-profile of single CT channel", fontsize=12)
+    axA.set_title("A) Time-profile of single CT channel (INVERTED)", fontsize=12)
     axA.set_xlabel("Projections")
     axA.set_ylabel("Signal [a.u.]")
     axA.legend(loc="upper right")
@@ -498,7 +547,7 @@ def main():
     axB.plot(x, y_fit, color="tab:purple", lw=2.5) # Using the fitted model only
     for pk in p: # Plot the detected transition points p1 to p12 as vertical lines
         axB.axvline(pk, color="k", ls="--", lw=0.8, alpha=0.7)
-    
+
     # Annotate plateau levels (s1-s7) at their approximate midpoints
     # Calculate representative x positions for each plateau's label
     x_positions_for_s_labels = []
@@ -520,10 +569,10 @@ def main():
     for i, (x_pos, s_val) in enumerate(zip(x_positions_for_s_labels, s)):
         # Adjust y-position slightly to avoid overlapping the line
         axB.text(x_pos, s_val, f"s{i+1}", 
-                 verticalalignment='bottom' if i<6 else 'top', # To keep labels from clashing
+                 verticalalignment='bottom' if i>=6 else 'top', # Adjusted for inverted pattern
                  horizontalalignment='center', fontsize=9, color='darkgreen')
 
-    axB.set_title("B) Schematic Step-wedge profile (fitted model)", fontsize=12)
+    axB.set_title("B) Schematic Step-wedge profile (fitted, INVERTED)", fontsize=12)
     axB.set_xlabel("Projections")
     axB.set_ylabel("Signal [a.u.]")
     axB.grid(True, linestyle=':', alpha=0.6)
@@ -544,21 +593,21 @@ def main():
 
     # Plot D: Nominal and Measured step length
     steps_indices = np.arange(1, 6) # Corresponds to step numbers 1 through 5
-    
+
     axD.plot(steps_indices, nominal_step_lengths_mm, "o-", color="grey", lw=2, label="Nominal Length")
     axD.plot(steps_indices, measured_lengths_mm, "o-", color="forestgreen", lw=2, label="Measured Length")
-    
+
     # Plot ±1% tolerance lines around nominal values
     axD.plot(steps_indices, nominal_step_lengths_mm * 1.01, "k--", lw=0.9, alpha=0.7, label="±1% Tolerance")
     axD.plot(steps_indices, nominal_step_lengths_mm * 0.99, "k--", lw=0.9, alpha=0.7)
-    
+
     axD.set_title("D) Nominal and Measured Step Length", fontsize=12)
     axD.set_xlabel("Step Number")
     axD.set_ylabel("Length [mm]")
     axD.set_xticks(steps_indices) # Set x-ticks to be exactly 1, 2, 3, 4, 5
     axD.legend(loc="best", fontsize=9)
     axD.grid(True, linestyle=':', alpha=0.6)
-    
+
     # Adjust y-limits to make the tolerance band clearly visible
     min_len = min(nominal_step_lengths_mm.min() * 0.98, measured_lengths_mm.min() * 0.98)
     max_len = max(nominal_step_lengths_mm.max() * 1.02, measured_lengths_mm.max() * 1.02)
@@ -566,12 +615,12 @@ def main():
 
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.98]) # Adjust layout to make space for suptitle if ever used
-    plt.suptitle("Step-Wedge QA Analysis", fontsize=16, y=0.99) # Optional overall title
+    plt.suptitle("Step-Wedge QA Analysis (INVERTED)", fontsize=16, y=0.99) # Optional overall title
     plt.savefig(OUT_PNG, dpi=200) # Increased DPI for higher quality output
     logging.info(f"Analysis complete. Figure saved to '{OUT_PNG}'")
 
     # Console summary
-    print("\n--- Summary of Analysis ---")
+    print("\n--- Summary of Analysis (INVERTED) ---")
     print(f"Fit R^2 for Time Profile: {r2:.4f}")
     print("\nDetected Plateau Signal Levels (s1-s7):")
     for i, val in enumerate(s):
@@ -589,4 +638,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
